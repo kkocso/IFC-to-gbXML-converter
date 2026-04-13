@@ -1,0 +1,39 @@
+# .github/dependabot.yml
+#
+# Automated dependency updates via GitHub Dependabot.
+#
+# What this does:
+#   - Weekly automated PRs for outdated packages (every Monday 08:00 UTC)
+#   - Groups dev-dependency updates to reduce PR noise
+#   - Security updates always get individual PRs immediately (Dependabot default)
+#   - Caps open PRs at 5 to avoid overwhelming maintainers
+#
+# Both ecosystems are included — Dependabot automatically skips any
+# ecosystem whose manifest file is not present in the repository.
+
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+    open-pull-requests-limit: 5
+    groups:
+      dev-dependencies:
+        dependency-type: "development"
+    labels:
+      - "dependencies"
+      - "security"
+
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "security"
