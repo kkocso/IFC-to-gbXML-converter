@@ -73,9 +73,9 @@ The converter relies on **2nd level space boundaries** (`IfcRelSpaceBoundary`) t
 3. Make sure **Export base quantities** is checked.
 4. Under **Space boundaries**, select **2nd level** (this is critical).
 5. Ensure rooms/spaces are properly defined and bounded in the Revit model.
-
+„
 ## IFC-to-gbXML entity mapping
-
+„
 The table below shows which IFC entities are read and what gbXML elements they produce.
 
 | IFC entity | gbXML element | Notes |

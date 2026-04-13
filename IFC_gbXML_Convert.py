@@ -60,11 +60,14 @@ def _init_geometry():
     WIRE = OCC.Core.TopAbs.TopAbs_WIRE
     EDGE = OCC.Core.TopAbs.TopAbs_EDGE
     VERTEX = OCC.Core.TopAbs.TopAbs_VERTEX
+    # PythonOCC API varies between versions:
+    #   older: topods_Face  /  newer: TopoDS_Face
+    TopoDS = OCC.Core.TopoDS
     _TOPO_CAST.update({
-        FACE: OCC.Core.TopoDS.topods_Face,
-        WIRE: OCC.Core.TopoDS.topods_Wire,
-        EDGE: OCC.Core.TopoDS.topods_Edge,
-        VERTEX: OCC.Core.TopoDS.topods_Vertex,
+        FACE: getattr(TopoDS, 'topods_Face', None) or TopoDS.TopoDS_Face,
+        WIRE: getattr(TopoDS, 'topods_Wire', None) or TopoDS.TopoDS_Wire,
+        EDGE: getattr(TopoDS, 'topods_Edge', None) or TopoDS.TopoDS_Edge,
+        VERTEX: getattr(TopoDS, 'topods_Vertex', None) or TopoDS.TopoDS_Vertex,
     })
 
 
@@ -515,11 +518,11 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             continue
 
         materials = element.HasAssociations[0].RelatingMaterial.ForLayerSet.MaterialLayers
-        for l in materials:
+        for layer_item in materials:
             material_id = root.createElement('MaterialId')
-            material_id.setAttribute('materialIdRef', 'mat_%d' % l.Material.id())
+            material_id.setAttribute('materialIdRef', 'mat_%d' % layer_item.Material.id())
             layer.appendChild(material_id)
-            dict_id['mat_%d' % l.Material.id()] = layer
+            dict_id['mat_%d' % layer_item.Material.id()] = layer
             gbxml.appendChild(layer)
 
     # -- Material (IfcBuildingElement -> IfcMaterialLayer) --------------------
@@ -534,23 +537,23 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             continue
 
         materials = element.HasAssociations[0].RelatingMaterial.ForLayerSet.MaterialLayers
-        for l in materials:
-            item = l.Material.id()
+        for layer_item in materials:
+            item = layer_item.Material.id()
             if item in listMat:
                 continue
             listMat.append(item)
 
             material = root.createElement('Material')
-            material.setAttribute('id', 'mat_%d' % l.Material.id())
-            dict_id['mat_%d' % l.Material.id()] = material
+            material.setAttribute('id', 'mat_%d' % layer_item.Material.id())
+            dict_id['mat_%d' % layer_item.Material.id()] = material
 
             name = root.createElement('Name')
-            name.appendChild(root.createTextNode(l.Material.Name))
+            name.appendChild(root.createTextNode(layer_item.Material.Name))
             material.appendChild(name)
 
             thickness = root.createElement('Thickness')
             thickness.setAttribute('unit', 'Meters')
-            valueT = l.LayerThickness
+            valueT = layer_item.LayerThickness
             thickness.appendChild(root.createTextNode(str(valueT)))
             material.appendChild(thickness)
 
@@ -558,7 +561,7 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             rValue.setAttribute('unit', 'SquareMeterKPerW')
 
             # Direct material properties (Pset_MaterialEnergy)
-            for material_property in l.Material.HasProperties:
+            for material_property in layer_item.Material.HasProperties:
                 if material_property.Name == 'Pset_MaterialEnergy':
                     for pset in material_property.Properties:
                         if pset.Name == 'ThermalConductivityTemperatureDerivative':

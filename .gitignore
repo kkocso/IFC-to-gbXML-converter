@@ -1,0 +1,37 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# --- Linter / type-checker caches ---
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# --- Converter I/O folders ---
+input/
+output/
+
+# --- Misc ---
+*.log
