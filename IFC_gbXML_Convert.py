@@ -161,6 +161,8 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
 
     # -- Campus (IfcSite) ----------------------------------------------------
     site = ifc_file.by_type('IfcSite')
+    campus = None
+    location = None
     for element in site:
         campus = root.createElement('Campus')
         campus.setAttribute('id', fix_xml_cmps(element.GlobalId))
@@ -170,41 +172,49 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
         location = root.createElement('Location')
         campus.appendChild(location)
 
-        longitude = root.createElement('Longitude')
-        longitude.appendChild(root.createTextNode(str(element.RefLongitude[0])))
-        location.appendChild(longitude)
+        if element.RefLongitude:
+            longitude = root.createElement('Longitude')
+            longitude.appendChild(root.createTextNode(str(element.RefLongitude[0])))
+            location.appendChild(longitude)
 
-        latitude = root.createElement('Latitude')
-        latitude.appendChild(root.createTextNode(str(element.RefLatitude[0])))
-        location.appendChild(latitude)
+        if element.RefLatitude:
+            latitude = root.createElement('Latitude')
+            latitude.appendChild(root.createTextNode(str(element.RefLatitude[0])))
+            location.appendChild(latitude)
 
         elevation = root.createElement('Elevation')
-        elevation.appendChild(root.createTextNode(str(element.RefElevation)))
+        elevation.appendChild(root.createTextNode(str(element.RefElevation or 0)))
         location.appendChild(elevation)
 
     address = ifc_file.by_type('IfcPostalAddress')
     for element in address:
-        zipcode = root.createElement('ZipcodeOrPostalCode')
-        zipcode.appendChild(root.createTextNode(element.PostalCode))
-        location.appendChild(zipcode)
+        if location is not None and element.PostalCode:
+            zipcode = root.createElement('ZipcodeOrPostalCode')
+            zipcode.appendChild(root.createTextNode(element.PostalCode))
+            location.appendChild(zipcode)
 
-        name = root.createElement('Name')
-        name.appendChild(root.createTextNode(element.Region + ', ' + element.Country))
-        location.appendChild(name)
+        if location is not None and element.Region and element.Country:
+            name = root.createElement('Name')
+            name.appendChild(root.createTextNode(element.Region + ', ' + element.Country))
+            location.appendChild(name)
 
     # -- Building (IfcBuilding) ----------------------------------------------
+    building = None
     buildings = ifc_file.by_type('IfcBuilding')
     for element in buildings:
         building = root.createElement('Building')
         building.setAttribute('id', fix_xml_bldng(element.GlobalId))
         building.setAttribute('buildingType', 'Unknown')
-        campus.appendChild(building)
+        if campus is not None:
+            campus.appendChild(building)
         dict_id[fix_xml_bldng(element.GlobalId)] = building
 
-    for element in address:
-        streetAddress = root.createElement('StreetAddress')
-        streetAddress.appendChild(root.createTextNode(element.Region + ', ' + element.Country))
-        building.appendChild(streetAddress)
+    if building is not None:
+        for element in address:
+            if element.Region and element.Country:
+                streetAddress = root.createElement('StreetAddress')
+                streetAddress.appendChild(root.createTextNode(element.Region + ', ' + element.Country))
+                building.appendChild(streetAddress)
 
     # -- BuildingStorey (IfcBuildingStorey) -----------------------------------
     storeys = ifc_file.by_type('IfcBuildingStorey')
@@ -212,7 +222,8 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
     for element in storeys:
         buildingStorey = root.createElement('BuildingStorey')
         buildingStorey.setAttribute('id', fix_xml_stry(element.GlobalId))
-        building.appendChild(buildingStorey)
+        if building is not None:
+            building.appendChild(buildingStorey)
         dict_id[fix_xml_stry(element.GlobalId)] = buildingStorey
 
         name = root.createElement('Name')
@@ -230,9 +241,11 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
     for s in spaces:
         space = root.createElement('Space')
         space.setAttribute('id', fix_xml_spc(s.GlobalId))
-        building.appendChild(space)
+        if building is not None:
+            building.appendChild(space)
         dict_id[fix_xml_spc(s.GlobalId)] = space
-        space.setAttribute('buildingStoreyIdRef', fix_xml_stry(s.Decomposes[0].RelatingObject.GlobalId))
+        if s.Decomposes:
+            space.setAttribute('buildingStoreyIdRef', fix_xml_stry(s.Decomposes[0].RelatingObject.GlobalId))
 
         area = root.createElement('Area')
         volume = root.createElement('Volume')
@@ -327,8 +340,9 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             if element.RelatedBuildingElement.is_a('IfcRoof'):
                 surface.setAttribute('surfaceType', 'Roof')
 
-            surface.setAttribute('constructionIdRef',
-                                 fix_xml_cons(element.RelatedBuildingElement.HasAssociations[0].GlobalId))
+            if element.RelatedBuildingElement.HasAssociations:
+                surface.setAttribute('constructionIdRef',
+                                     fix_xml_cons(element.RelatedBuildingElement.HasAssociations[0].GlobalId))
 
             name = root.createElement('Name')
             name.appendChild(root.createTextNode(fix_xml_name(element.GlobalId)))
@@ -428,19 +442,20 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
         visualLight = root.createElement('Transmittance')
         for r in analyticValue:
             if r.is_a('IfcRelDefinesByType'):
-                if r.RelatingType.is_a('IfcWindowStyle'):
-                    for p in r.RelatingType.HasPropertySets:
-                        if p.Name == 'Analytical Properties(Type)':
-                            for t in p.HasProperties:
-                                if t.Name == 'Solar Heat Gain Coefficient':
-                                    solarHeat.setAttribute('unit', 'Fraction')
-                                    solarHeat.appendChild(root.createTextNode(str(t.NominalValue.wrappedValue)))
-                                    window.appendChild(solarHeat)
-                                if t.Name == 'Visual Light Transmittance':
-                                    visualLight.setAttribute('unit', 'Fraction')
-                                    visualLight.setAttribute('type', 'Visible')
-                                    visualLight.appendChild(root.createTextNode(str(t.NominalValue.wrappedValue)))
-                                    window.appendChild(visualLight)
+                if r.RelatingType and r.RelatingType.is_a('IfcWindowStyle'):
+                    if r.RelatingType.HasPropertySets:
+                        for p in r.RelatingType.HasPropertySets:
+                            if p.Name == 'Analytical Properties(Type)':
+                                for t in (p.HasProperties or []):
+                                    if t.Name == 'Solar Heat Gain Coefficient':
+                                        solarHeat.setAttribute('unit', 'Fraction')
+                                        solarHeat.appendChild(root.createTextNode(str(t.NominalValue.wrappedValue)))
+                                        window.appendChild(solarHeat)
+                                    if t.Name == 'Visual Light Transmittance':
+                                        visualLight.setAttribute('unit', 'Fraction')
+                                        visualLight.setAttribute('type', 'Visible')
+                                        visualLight.appendChild(root.createTextNode(str(t.NominalValue.wrappedValue)))
+                                        window.appendChild(visualLight)
 
     # -- Construction (IfcRelSpaceBoundary -> material associations) ----------
     listCon = []
@@ -452,6 +467,8 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
                 or element.RelatedBuildingElement.is_a('IfcWall')
                 or element.RelatedBuildingElement.is_a('IfcRoof')):
             continue
+        if not element.RelatedBuildingElement.HasAssociations:
+            continue
 
         constructions = element.RelatedBuildingElement.HasAssociations[0].GlobalId
         if constructions in listCon:
@@ -462,12 +479,12 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
         construction.setAttribute('id', fix_xml_cons(element.RelatedBuildingElement.HasAssociations[0].GlobalId))
         dict_id[fix_xml_cons(element.RelatedBuildingElement.HasAssociations[0].GlobalId)] = construction
 
-        analyticValue = element.RelatedBuildingElement.IsDefinedBy
+        analyticValue = element.RelatedBuildingElement.IsDefinedBy or []
         u_value = root.createElement('U-value')
         for r in analyticValue:
             if r.is_a('IfcRelDefinesByProperties'):
                 if r.RelatingPropertyDefinition.is_a('IfcPropertySet'):
-                    for p in r.RelatingPropertyDefinition.HasProperties:
+                    for p in (r.RelatingPropertyDefinition.HasProperties or []):
                         if element.RelatedBuildingElement.is_a('IfcWall') and p.Name == 'ThermalTransmittance':
                             u_value.setAttribute('unit', 'WPerSquareMeterK')
                             u_value.appendChild(root.createTextNode(str(p.NominalValue.wrappedValue)))
@@ -481,7 +498,7 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
         for r in analyticValue:
             if r.is_a('IfcRelDefinesByProperties'):
                 if r.RelatingPropertyDefinition.is_a('IfcPropertySet'):
-                    for p in r.RelatingPropertyDefinition.HasProperties:
+                    for p in (r.RelatingPropertyDefinition.HasProperties or []):
                         if p.Name == 'Absorptance':
                             absorptance.setAttribute('unit', 'Fraction')
                             absorptance.setAttribute('type', 'ExtIR')
@@ -493,9 +510,13 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
         layer_id.setAttribute('layerIdRef', layerId)
         construction.appendChild(layer_id)
 
+        # Try to get the layer set name from the material association
+        try:
+            layer_set_name = element.RelatedBuildingElement.HasAssociations[0].RelatingMaterial.ForLayerSet.LayerSetName
+        except (AttributeError, TypeError):
+            layer_set_name = 'Unknown'
         name = root.createElement('Name')
-        name.appendChild(root.createTextNode(
-            element.RelatedBuildingElement.HasAssociations[0].RelatingMaterial.ForLayerSet.LayerSetName))
+        name.appendChild(root.createTextNode(layer_set_name or 'Unknown'))
         construction.appendChild(name)
 
         gbxml.appendChild(construction)
@@ -508,17 +529,24 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             continue
         if element.IsDecomposedBy:
             continue
+        if not element.HasAssociations:
+            continue
 
         layerId = fix_xml_layer(element.HasAssociations[0].GlobalId)
         layer = root.createElement('Layer')
         layer.setAttribute('id', layerId)
         dict_id[layerId] = layer
 
-        if not element.HasAssociations[0].RelatingMaterial.is_a('IfcMaterialLayerSetUsage'):
+        try:
+            if not element.HasAssociations[0].RelatingMaterial.is_a('IfcMaterialLayerSetUsage'):
+                continue
+            materials = element.HasAssociations[0].RelatingMaterial.ForLayerSet.MaterialLayers
+        except (AttributeError, TypeError):
             continue
 
-        materials = element.HasAssociations[0].RelatingMaterial.ForLayerSet.MaterialLayers
-        for layer_item in materials:
+        for layer_item in (materials or []):
+            if layer_item.Material is None:
+                continue
             material_id = root.createElement('MaterialId')
             material_id.setAttribute('materialIdRef', 'mat_%d' % layer_item.Material.id())
             layer.appendChild(material_id)
@@ -533,11 +561,19 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             continue
         if element.IsDecomposedBy:
             continue
-        if not element.HasAssociations[0].RelatingMaterial.is_a('IfcMaterialLayerSetUsage'):
+        if not element.HasAssociations:
             continue
 
-        materials = element.HasAssociations[0].RelatingMaterial.ForLayerSet.MaterialLayers
-        for layer_item in materials:
+        try:
+            if not element.HasAssociations[0].RelatingMaterial.is_a('IfcMaterialLayerSetUsage'):
+                continue
+            materials = element.HasAssociations[0].RelatingMaterial.ForLayerSet.MaterialLayers
+        except (AttributeError, TypeError):
+            continue
+
+        for layer_item in (materials or []):
+            if layer_item.Material is None:
+                continue
             item = layer_item.Material.id()
             if item in listMat:
                 continue
@@ -548,12 +584,12 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             dict_id['mat_%d' % layer_item.Material.id()] = material
 
             name = root.createElement('Name')
-            name.appendChild(root.createTextNode(layer_item.Material.Name))
+            name.appendChild(root.createTextNode(layer_item.Material.Name or 'Unknown'))
             material.appendChild(name)
 
             thickness = root.createElement('Thickness')
             thickness.setAttribute('unit', 'Meters')
-            valueT = layer_item.LayerThickness
+            valueT = layer_item.LayerThickness or 0
             thickness.appendChild(root.createTextNode(str(valueT)))
             material.appendChild(thickness)
 
@@ -561,21 +597,24 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             rValue.setAttribute('unit', 'SquareMeterKPerW')
 
             # Direct material properties (Pset_MaterialEnergy)
-            for material_property in layer_item.Material.HasProperties:
+            for material_property in (getattr(layer_item.Material, 'HasProperties', None) or []):
                 if material_property.Name == 'Pset_MaterialEnergy':
-                    for pset in material_property.Properties:
+                    for pset in (material_property.Properties or []):
                         if pset.Name == 'ThermalConductivityTemperatureDerivative':
                             rValue.appendChild(root.createTextNode(str(pset.NominalValue.wrappedValue)))
                             material.appendChild(rValue)
                             gbxml.appendChild(material)
 
             # Analytical properties via type or property sets
-            for r in element.IsDefinedBy:
-                if r.is_a('IfcRelDefinesByType') and r.RelatingType.is_a('IfcWallType'):
+            for r in (element.IsDefinedBy or []):
+                if (r.is_a('IfcRelDefinesByType')
+                        and r.RelatingType is not None
+                        and r.RelatingType.is_a('IfcWallType')
+                        and r.RelatingType.HasPropertySets):
                     for p in r.RelatingType.HasPropertySets:
                         if p.Name == 'Analytical Properties(Type)':
-                            for t in p.HasProperties:
-                                if t.Name == 'Heat Transfer Coefficient (U)':
+                            for t in (p.HasProperties or []):
+                                if t.Name == 'Heat Transfer Coefficient (U)' and t.NominalValue and t.NominalValue.wrappedValue:
                                     valueR = valueT / t.NominalValue.wrappedValue
                                     rValue.appendChild(root.createTextNode(str(valueR)))
                                     material.appendChild(rValue)
@@ -583,25 +622,29 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
 
                 if r.is_a('IfcRelDefinesByProperties'):
                     if r.RelatingPropertyDefinition.is_a('IfcPropertySet'):
-                        for p in r.RelatingPropertyDefinition.HasProperties:
-                            if p.Name == 'Heat Transfer Coefficient (U)':
+                        for p in (r.RelatingPropertyDefinition.HasProperties or []):
+                            if p.Name == 'Heat Transfer Coefficient (U)' and p.NominalValue and p.NominalValue.wrappedValue:
                                 valueR = valueT / p.NominalValue.wrappedValue
                                 rValue.setAttribute('unit', 'SquareMeterKPerW')
                                 rValue.appendChild(root.createTextNode(str(valueR)))
                                 material.appendChild(rValue)
                                 gbxml.appendChild(material)
 
-                if element.is_a('IfcCovering') and r.is_a('IfcRelDefinesByProperties'):
-                    if r.RelatingType.is_a('IfcPropertySet'):
-                        for p in r.RelatingType.HasPropertySets:
-                            if p.Name == 'Analytical Properties(Type)':
-                                for t in p.HasProperties:
-                                    if t.Name == 'Heat Transfer Coefficient (U)':
-                                        valueR = valueT / t.NominalValue.wrappedValue
-                                        rValue.setAttribute('unit', 'SquareMeterKPerW')
-                                        rValue.appendChild(root.createTextNode(str(valueR)))
-                                        material.appendChild(rValue)
-                                        gbxml.appendChild(material)
+                if (element.is_a('IfcCovering')
+                        and r.is_a('IfcRelDefinesByProperties')
+                        and hasattr(r, 'RelatingType')
+                        and r.RelatingType is not None
+                        and r.RelatingType.is_a('IfcPropertySet')
+                        and r.RelatingType.HasPropertySets):
+                    for p in r.RelatingType.HasPropertySets:
+                        if p.Name == 'Analytical Properties(Type)':
+                            for t in (p.HasProperties or []):
+                                if t.Name == 'Heat Transfer Coefficient (U)' and t.NominalValue and t.NominalValue.wrappedValue:
+                                    valueR = valueT / t.NominalValue.wrappedValue
+                                    rValue.setAttribute('unit', 'SquareMeterKPerW')
+                                    rValue.appendChild(root.createTextNode(str(valueR)))
+                                    material.appendChild(rValue)
+                                    gbxml.appendChild(material)
 
     # -- DocumentHistory -----------------------------------------------------
     programInfo = ifc_file.by_type('IfcApplication')
