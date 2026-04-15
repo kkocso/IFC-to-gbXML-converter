@@ -138,6 +138,63 @@ def get_boundary_vertices(geom):
     return _transform_2d_to_3d(points_2d, placement)
 
 
+def _compute_surface_normal(vertices):
+    """
+    Compute unit normal vector from a polygon's vertices using Newell's method.
+    Returns (nx, ny, nz).
+    """
+    n = [0.0, 0.0, 0.0]
+    count = len(vertices)
+    for i in range(count):
+        v1 = vertices[i]
+        v2 = vertices[(i + 1) % count]
+        n[0] += (v1[1] - v2[1]) * (v1[2] + v2[2])
+        n[1] += (v1[2] - v2[2]) * (v1[0] + v2[0])
+        n[2] += (v1[0] - v2[0]) * (v1[1] + v2[1])
+    length = math.sqrt(sum(c * c for c in n))
+    if length < 1e-12:
+        return (0.0, 0.0, 1.0)
+    return tuple(c / length for c in n)
+
+
+def _normal_to_azimuth_tilt(normal):
+    """
+    Convert a surface outward normal vector to gbXML Azimuth and Tilt angles.
+    Azimuth: degrees clockwise from North (Y+ axis), range [0, 360).
+    Tilt:    degrees from upward vertical; 0=ceiling, 90=wall, 180=floor.
+    """
+    nx, ny, nz = normal
+    # Tilt from upward vertical (Z+)
+    tilt = math.degrees(math.acos(max(-1.0, min(1.0, nz))))
+    # Azimuth only meaningful for non-horizontal surfaces
+    horiz_len = math.sqrt(nx * nx + ny * ny)
+    if horiz_len < 1e-6:
+        azimuth = 0.0  # floor or ceiling: azimuth undefined
+    else:
+        # atan2(nx, ny): angle from Y+(North) clockwise to horizontal projection
+        azimuth = math.degrees(math.atan2(nx, ny)) % 360.0
+    return round(azimuth, 2), round(tilt, 2)
+
+
+def _compute_surface_width(vertices, normal):
+    """
+    Compute the wall width (horizontal extent) in the direction perpendicular
+    to the surface normal and perpendicular to Z (i.e. along the wall length).
+    For a vertical wall: returns the wall length in metres.
+    For a horizontal surface: returns the extent in X.
+    """
+    nx, ny, nz = normal
+    # Horizontal direction = cross(normal, Z_up) = (ny*1-nz*0, nz*0-nx*1, 0) = (ny, -nx, 0)
+    hx, hy = ny, -nx
+    h_len = math.sqrt(hx * hx + hy * hy)
+    if h_len < 1e-9:
+        hx, hy = 1.0, 0.0  # for floor/ceiling: project onto X
+    else:
+        hx, hy = hx / h_len, hy / h_len
+    projections = [v[0] * hx + v[1] * hy for v in vertices]
+    return round(max(projections) - min(projections), 4)
+
+
 # ---------------------------------------------------------------------------
 # XML ID sanitisation helpers
 # ---------------------------------------------------------------------------
@@ -170,6 +227,28 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
 
     print(f"[INFO] Opening IFC file: {ifc_path}")
     ifc_file = ifcopenshell.open(str(ifc_path))
+
+    # Detect IFC project length unit and compute scale factor to convert to metres.
+    # ArchiCAD typically exports in MILLIMETRE → scale = 0.001.
+    # If the project uses METRE → scale = 1.0.
+    _prefix_scales = {
+        'EXA': 1e18, 'PETA': 1e15, 'TERA': 1e12, 'GIGA': 1e9, 'MEGA': 1e6,
+        'KILO': 1e3, 'HECTO': 1e2, 'DECA': 1e1,
+        None: 1.0,
+        'DECI': 1e-1, 'CENTI': 1e-2, 'MILLI': 1e-3, 'MICRO': 1e-6,
+        'NANO': 1e-9, 'PICO': 1e-12, 'FEMTO': 1e-15, 'ATTO': 1e-18,
+    }
+    length_scale = 1.0  # default: already in metres
+    try:
+        for unit_assign in ifc_file.by_type('IfcUnitAssignment'):
+            for u in unit_assign.Units:
+                if u.is_a('IfcSIUnit') and u.UnitType == 'LENGTHUNIT':
+                    prefix = getattr(u, 'Prefix', None)
+                    length_scale = _prefix_scales.get(prefix, 1.0)
+                    break
+    except Exception:
+        pass
+    print(f"[INFO] IFC length unit scale factor: {length_scale} (1.0 = metres, 0.001 = millimetres)")
 
     # Create the XML root
     root = minidom.Document()
@@ -357,6 +436,10 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
         buildingStorey.appendChild(level)
 
     # -- Space (IfcSpace) ----------------------------------------------------
+    # space_heights: GlobalId → room height in metres (from BaseQuantities)
+    # Used later to populate Surface/RectangularGeometry/Height
+    space_heights = {}
+
     spaces = ifc_file.by_type('IfcSpace')
     space_idx = 1
     for s in spaces:
@@ -407,7 +490,35 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             area_el.appendChild(root.createTextNode(str(round(float(area_val), 4))))
             space.appendChild(area_el)
 
-        # Volume (GrossVolume preferred, fallback NetVolume)
+        # Height fields – written BEFORE Volume and Name so Winwatt's sequential
+        # parser encounters them early.  Written in three ways for max compatibility:
+        #   (a) 'height' XML attribute on <Space>
+        #   (b) <Height> child element (Winwatt custom)
+        #   (c) stored in space_heights dict → later used in Surface RectGeom
+        height_fields = [
+            ('Height',              'Height'),
+            ('FinishCeilingHeight', 'CeilingHeight'),
+            ('ClearHeight',         'ClearHeight'),
+            ('FinishFloorHeight',   'FinishFloorHeight'),
+        ]
+        for bq_key, xml_tag in height_fields:
+            if bq_key not in bq:
+                continue
+            try:
+                h_val = bq[bq_key].LengthValue
+            except AttributeError:
+                continue
+            if h_val is None:
+                continue
+            h_m = round(float(h_val) * length_scale, 4)
+            if xml_tag == 'Height':
+                space.setAttribute('height', str(h_m))   # (a)
+                space_heights[s.GlobalId] = h_m           # (c)
+            h_el = root.createElement(xml_tag)            # (b)
+            h_el.appendChild(root.createTextNode(str(h_m)))
+            space.appendChild(h_el)
+
+        # Volume (written after Height so Winwatt reads Height first)
         vol_val = None
         for key in ('GrossVolume', 'NetVolume'):
             if key in bq:
@@ -423,7 +534,7 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             vol_el.appendChild(root.createTextNode(str(round(float(vol_val), 4))))
             space.appendChild(vol_el)
 
-        # Build display name: room number + function (for <Name> child element)
+        # Build display name
         if room_number and room_function:
             display_name = f'{room_number} {room_function}'
         elif room_function:
@@ -438,39 +549,10 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
         name_el.appendChild(root.createTextNode(display_name))
         space.appendChild(name_el)
 
-        # Description = function name
         if room_function:
             desc = root.createElement('Description')
             desc.appendChild(root.createTextNode(room_function))
             space.appendChild(desc)
-
-        # Height fields – tag names matched to Winwatt's expected gbXML import format.
-        # Winwatt uses <Height> for room height and <CeilingHeight> for false ceiling.
-        # When <Height> is present, Winwatt calculates Volume = Area × Height automatically.
-        # IFC BaseQuantities mapping:
-        #   Height              → <Height>         (Belmagasság)
-        #   FinishCeilingHeight → <CeilingHeight>  (Álmennyezetmagasság)
-        #   ClearHeight         → <ClearHeight>    (Szabad belmagasság, extra info)
-        #   FinishFloorHeight   → <FinishFloorHeight> (Padlóburkolat szintje, extra info)
-        height_fields = [
-            ('Height',              'Height',            'Meters'),
-            ('FinishCeilingHeight', 'CeilingHeight',     'Meters'),
-            ('ClearHeight',         'ClearHeight',       'Meters'),
-            ('FinishFloorHeight',   'FinishFloorHeight', 'Meters'),
-        ]
-        for bq_key, xml_tag, unit in height_fields:
-            if bq_key not in bq:
-                continue
-            try:
-                h_val = bq[bq_key].LengthValue
-            except AttributeError:
-                continue
-            if h_val is None:
-                continue
-            h_el = root.createElement(xml_tag)
-            h_el.setAttribute('unit', unit)
-            h_el.appendChild(root.createTextNode(str(round(float(h_val), 4))))
-            space.appendChild(h_el)
 
         # -- SpaceBoundary ---------------------------------------------------
         for element in s.BoundedBy:
@@ -507,15 +589,24 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
                 for v in vertices:
                     x, y, z = v
                     point = root.createElement('CartesianPoint')
-                    for c in (x, y, z):
+                    for c in (x * length_scale, y * length_scale, z * length_scale):
                         coord = root.createElement('Coordinate')
-                        coord.appendChild(root.createTextNode(str(c)))
+                        coord.appendChild(root.createTextNode(str(round(c, 6))))
                         point.appendChild(coord)
                     polyLoop.appendChild(point)
 
                 planarGeometry.appendChild(polyLoop)
 
     # -- Surface (IfcRelSpaceBoundary) ---------------------------------------
+    # Deduplicate by building element GlobalId:
+    #   Each physical element (IfcWall, IfcSlab…) must appear only ONCE as a
+    #   <Surface>.  When the same element is encountered again (because it borders
+    #   another space, or because a window splits the wall into fragments), we only
+    #   add a new <AdjacentSpaceId> to the existing Surface instead of creating a
+    #   duplicate.  This keeps the surface count in line with the actual floor plan.
+    element_to_surface = {}   # element GlobalId → Surface XML node
+    window_to_opening  = {}   # window GlobalId → Opening XML node (dedup)
+
     boundaries = ifc_file.by_type('IfcRelSpaceBoundary')
     opening_id = 1
     surface = None  # keep reference for Window openings appended below
@@ -543,10 +634,38 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
         if not (is_wall_or_slab or is_window):
             continue
 
+        # --- Deduplication for wall/slab/roof/covering elements ---------------
+        if is_wall_or_slab:
+            elem_gid = element.RelatedBuildingElement.GlobalId
+            if elem_gid in element_to_surface:
+                surface = element_to_surface[elem_gid]
+                # Fix 6: upgrade InteriorWall → ExteriorWall if this boundary
+                # is EXTERNAL (first encounter may have been from inside a room)
+                if (element.RelatedBuildingElement.is_a('IfcWall')
+                        and element.InternalOrExternalBoundary == 'EXTERNAL'
+                        and surface.getAttribute('surfaceType') == 'InteriorWall'):
+                    surface.setAttribute('surfaceType', 'ExteriorWall')
+                # Register adjacent space if not already listed
+                existing_refs = {
+                    n.getAttribute('spaceIdRef')
+                    for n in surface.getElementsByTagName('AdjacentSpaceId')
+                }
+                space_ref = fix_xml_spc(element.RelatingSpace.GlobalId)
+                if space_ref not in existing_refs:
+                    adj = root.createElement('AdjacentSpaceId')
+                    adj.setAttribute('spaceIdRef', space_ref)
+                    surface.appendChild(adj)
+                continue  # no new Surface needed
+        # ----------------------------------------------------------------------
+
         vertices = get_boundary_vertices(surfaceGeom)
         if not vertices:
             print(f"[WARN] Skipping boundary {element.GlobalId}: no vertices extracted")
             continue
+
+        # Scale vertices to metres
+        scaled_vertices = [(x * length_scale, y * length_scale, z * length_scale)
+                           for (x, y, z) in vertices]
 
         if is_wall_or_slab:
             surface = root.createElement('Surface')
@@ -576,16 +695,54 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             adjacentSpaceId.setAttribute('spaceIdRef', fix_xml_spc(element.RelatingSpace.GlobalId))
             surface.appendChild(adjacentSpaceId)
 
+            # RectangularGeometry: Azimuth + Tilt + Height + Width per surface.
+            # Winwatt reads Azimuth/Tilt (confirmed working).
+            # Height: only for vertical walls (tilt ≈ 90°) — Fix 4: ceilings/
+            #         floors (tilt ≈ 0°/180°) must NOT get a room height value.
+            # Width:  horizontal wall length, Fix 2: maps to Winwatt's x field.
+            if len(scaled_vertices) >= 3:
+                normal = _compute_surface_normal(scaled_vertices)
+                azimuth, tilt = _normal_to_azimuth_tilt(normal)
+                rectGeom = root.createElement('RectangularGeometry')
+
+                az_el = root.createElement('Azimuth')
+                az_el.appendChild(root.createTextNode(str(azimuth)))
+                rectGeom.appendChild(az_el)
+
+                tilt_el = root.createElement('Tilt')
+                tilt_el.appendChild(root.createTextNode(str(tilt)))
+                rectGeom.appendChild(tilt_el)
+
+                is_vertical = abs(tilt - 90.0) < 45.0  # roughly a wall
+                if is_vertical:
+                    # Fix 4: Height only for vertical (wall) surfaces
+                    space_gid = element.RelatingSpace.GlobalId
+                    if space_gid in space_heights:
+                        surf_h = space_heights[space_gid]
+                    else:
+                        zs = [v[2] for v in scaled_vertices]
+                        surf_h = round(max(zs) - min(zs), 4) if zs else 0.0
+                    h_el = root.createElement('Height')
+                    h_el.appendChild(root.createTextNode(str(surf_h)))
+                    rectGeom.appendChild(h_el)
+
+                    # Fix 2: Width = horizontal wall length (Winwatt x field)
+                    wall_w = _compute_surface_width(scaled_vertices, normal)
+                    w_el = root.createElement('Width')
+                    w_el.appendChild(root.createTextNode(str(wall_w)))
+                    rectGeom.appendChild(w_el)
+
+                surface.appendChild(rectGeom)
+
             planarGeometry = root.createElement('PlanarGeometry')
             surface.appendChild(planarGeometry)
 
             polyLoop = root.createElement('PolyLoop')
-            for v in vertices:
-                x, y, z = v
+            for (x, y, z) in scaled_vertices:
                 point = root.createElement('CartesianPoint')
                 for c in (x, y, z):
                     coord = root.createElement('Coordinate')
-                    coord.appendChild(root.createTextNode(str(c)))
+                    coord.appendChild(root.createTextNode(str(round(c, 6))))
                     point.appendChild(coord)
                 polyLoop.appendChild(point)
             planarGeometry.appendChild(polyLoop)
@@ -595,34 +752,60 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             surface.appendChild(objectId)
 
             campus.appendChild(surface)
+            # Register so duplicate boundaries don't create extra surfaces
+            element_to_surface[element.RelatedBuildingElement.GlobalId] = surface
 
         if is_window and surface is not None:
+            win_gid = element.RelatedBuildingElement.GlobalId
+            # Fix 3: deduplicate windows – one Opening per IfcWindow element
+            if win_gid in window_to_opening:
+                continue
+
             opening = root.createElement('Opening')
-            opening.setAttribute('windowTypeIdRef', fix_xml_id(element.RelatedBuildingElement.GlobalId))
+            opening.setAttribute('windowTypeIdRef', fix_xml_id(win_gid))
             opening.setAttribute('openingType', 'OperableWindow')
             opening.setAttribute('id', 'Opening%d' % opening_id)
             opening_id += 1
+            window_to_opening[win_gid] = opening
+
+            # Fix 5: window dimensions from IFC OverallWidth / OverallHeight
+            win_el = element.RelatedBuildingElement
+            try:
+                win_h = getattr(win_el, 'OverallHeight', None)
+                win_w = getattr(win_el, 'OverallWidth', None)
+                if win_h is not None and win_w is not None:
+                    win_h_m = round(float(win_h) * length_scale, 4)
+                    win_w_m = round(float(win_w) * length_scale, 4)
+                    winRectGeom = root.createElement('RectangularGeometry')
+                    wh = root.createElement('Height')
+                    wh.appendChild(root.createTextNode(str(win_h_m)))
+                    winRectGeom.appendChild(wh)
+                    ww = root.createElement('Width')
+                    ww.appendChild(root.createTextNode(str(win_w_m)))
+                    winRectGeom.appendChild(ww)
+                    opening.appendChild(winRectGeom)
+            except Exception:
+                pass
 
             planarGeometry = root.createElement('PlanarGeometry')
             opening.appendChild(planarGeometry)
 
             polyLoop = root.createElement('PolyLoop')
-            for v in vertices:
-                x, y, z = v
+            for (x, y, z) in scaled_vertices:
                 point = root.createElement('CartesianPoint')
                 for c in (x, y, z):
                     coord = root.createElement('Coordinate')
-                    coord.appendChild(root.createTextNode(str(c)))
+                    coord.appendChild(root.createTextNode(str(round(c, 6))))
                     point.appendChild(coord)
                 polyLoop.appendChild(point)
             planarGeometry.appendChild(polyLoop)
 
             name = root.createElement('Name')
-            name.appendChild(root.createTextNode(fix_xml_name(element.RelatedBuildingElement.Name)))
+            name.appendChild(root.createTextNode(fix_xml_name(win_el.Name or win_gid)))
             opening.appendChild(name)
 
             objectId = root.createElement('CADObjectId')
-            objectId.appendChild(root.createTextNode(fix_xml_name(element.RelatedBuildingElement.Name)))
+            objectId.appendChild(root.createTextNode(fix_xml_name(win_el.Name or win_gid)))
             opening.appendChild(objectId)
 
             surface.appendChild(opening)
