@@ -270,12 +270,21 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
         for element in s.BoundedBy:
             if element.RelatedBuildingElement is None:
                 continue
+            # Skip virtual boundaries – they have no physical surface geometry
+            if element.PhysicalOrVirtualBoundary == 'VIRTUAL':
+                continue
 
             boundaryGeom = element.ConnectionGeometry.SurfaceOnRelatingElement
+            if boundaryGeom is None:
+                continue
             if boundaryGeom.is_a('IfcCurveBoundedPlane') and boundaryGeom.InnerBoundaries is None:
                 boundaryGeom.InnerBoundaries = ()
 
-            space_boundary_shape = ifcopenshell.geom.create_shape(settings, boundaryGeom)
+            try:
+                space_boundary_shape = ifcopenshell.geom.create_shape(settings, boundaryGeom)
+            except Exception as e:
+                print(f"[WARN] Skipping SpaceBoundary {element.GlobalId}: geometry error – {e}")
+                continue
 
             if (element.RelatedBuildingElement.is_a('IfcCovering')
                     or element.RelatedBuildingElement.is_a('IfcSlab')
@@ -290,7 +299,11 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
                 planarGeometry = root.createElement('PlanarGeometry')
                 spaceBoundary.appendChild(planarGeometry)
 
-                new_z = element.RelatingSpace.ObjectPlacement.PlacementRelTo.RelativePlacement.Location.Coordinates[2]
+                try:
+                    placement = element.RelatingSpace.ObjectPlacement.PlacementRelTo
+                    new_z = placement.RelativePlacement.Location.Coordinates[2] if placement else 0.0
+                except (AttributeError, TypeError, IndexError):
+                    new_z = 0.0
                 polyLoop = root.createElement('PolyLoop')
 
                 for v in get_vertices(space_boundary_shape):
@@ -308,8 +321,14 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
     # -- Surface (IfcRelSpaceBoundary) ---------------------------------------
     boundaries = ifc_file.by_type('IfcRelSpaceBoundary')
     opening_id = 1
+    surface = None  # keep reference for Window openings appended below
     for element in boundaries:
         if element.RelatedBuildingElement is None:
+            continue
+        # Skip virtual boundaries – they carry no physical surface
+        if element.PhysicalOrVirtualBoundary == 'VIRTUAL':
+            continue
+        if element.ConnectionGeometry is None:
             continue
         if element.ConnectionGeometry.SurfaceOnRelatingElement is None:
             continue
@@ -318,7 +337,19 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
         if surfaceGeom.is_a('IfcCurveBoundedPlane') and surfaceGeom.InnerBoundaries is None:
             surfaceGeom.InnerBoundaries = ()
 
-        space_boundary_shape = ifcopenshell.geom.create_shape(settings, surfaceGeom)
+        try:
+            space_boundary_shape = ifcopenshell.geom.create_shape(settings, surfaceGeom)
+        except Exception as e:
+            print(f"[WARN] Skipping Surface {element.GlobalId}: geometry error – {e}")
+            continue
+
+        def _get_z(elem):
+            """Safely extract storey elevation offset."""
+            try:
+                placement = elem.RelatingSpace.ObjectPlacement.PlacementRelTo
+                return placement.RelativePlacement.Location.Coordinates[2] if placement else 0.0
+            except (AttributeError, TypeError, IndexError):
+                return 0.0
 
         if (element.RelatedBuildingElement.is_a('IfcCovering')
                 or element.RelatedBuildingElement.is_a('IfcSlab')
@@ -355,7 +386,7 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             planarGeometry = root.createElement('PlanarGeometry')
             surface.appendChild(planarGeometry)
 
-            new_z = element.RelatingSpace.ObjectPlacement.PlacementRelTo.RelativePlacement.Location.Coordinates[2]
+            new_z = _get_z(element)
             polyLoop = root.createElement('PolyLoop')
 
             for v in get_vertices(space_boundary_shape):
@@ -376,7 +407,7 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
 
             campus.appendChild(surface)
 
-        if element.RelatedBuildingElement.is_a('IfcWindow'):
+        if element.RelatedBuildingElement.is_a('IfcWindow') and surface is not None:
             opening = root.createElement('Opening')
             opening.setAttribute('windowTypeIdRef', fix_xml_id(element.RelatedBuildingElement.GlobalId))
             opening.setAttribute('openingType', 'OperableWindow')
@@ -386,7 +417,7 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             planarGeometry = root.createElement('PlanarGeometry')
             opening.appendChild(planarGeometry)
 
-            new_z = element.RelatingSpace.ObjectPlacement.PlacementRelTo.RelativePlacement.Location.Coordinates[2]
+            new_z = _get_z(element)
             polyLoop = root.createElement('PolyLoop')
 
             for v in get_vertices(space_boundary_shape):
