@@ -14,14 +14,15 @@ Output:
 
 Requirements:
     - ifcopenshell  (conda install -c conda-forge ifcopenshell)
-    - pythonocc-core (conda install -c conda-forge pythonocc-core)
     - The IFC file must contain 2nd level space boundaries (IfcRelSpaceBoundary).
+    - pythonocc-core is NO LONGER required.
 
 Author: Maarten Visschers (original), refactored for CLI usage.
 """
 
 import argparse
 import datetime
+import math
 import os
 import sys
 import time
@@ -29,81 +30,112 @@ from pathlib import Path
 from xml.dom import minidom
 
 
-def _load_geometry_libs():
-    """Lazy-load heavy geometry dependencies so --help works without them."""
-    import ifcopenshell.geom
-    import OCC.Core.BRep
-    import OCC.Core.BRepTools
-    import OCC.Core.ProjLib
-    import OCC.Core.TopAbs
-    import OCC.Core.TopExp
-    import OCC.Core.TopoDS
-    return ifcopenshell, OCC
-
-
-# Module-level references (populated by convert())
+# Module-level reference (populated by _init_geometry)
 ifcopenshell = None
-OCC = None
-
-# ---------------------------------------------------------------------------
-# Geometry helpers – convert implicit IFC geometry to explicit coordinates
-# ---------------------------------------------------------------------------
-FACE = WIRE = EDGE = VERTEX = None
-_TOPO_CAST = {}
 
 
 def _init_geometry():
-    """Initialise geometry constants after imports are loaded."""
-    global FACE, WIRE, EDGE, VERTEX, _TOPO_CAST, ifcopenshell, OCC
-    ifcopenshell, OCC = _load_geometry_libs()
-    FACE = OCC.Core.TopAbs.TopAbs_FACE
-    WIRE = OCC.Core.TopAbs.TopAbs_WIRE
-    EDGE = OCC.Core.TopAbs.TopAbs_EDGE
-    VERTEX = OCC.Core.TopAbs.TopAbs_VERTEX
-    # PythonOCC API varies between versions:
-    #   older: topods_Face  /  newer: TopoDS_Face
-    TopoDS = OCC.Core.TopoDS
-    _TOPO_CAST.update({
-        FACE: getattr(TopoDS, 'topods_Face', None) or TopoDS.TopoDS_Face,
-        WIRE: getattr(TopoDS, 'topods_Wire', None) or TopoDS.TopoDS_Wire,
-        EDGE: getattr(TopoDS, 'topods_Edge', None) or TopoDS.TopoDS_Edge,
-        VERTEX: getattr(TopoDS, 'topods_Vertex', None) or TopoDS.TopoDS_Vertex,
-    })
+    """Import ifcopenshell (no OCC required)."""
+    global ifcopenshell
+    import ifcopenshell as _ifc
+    ifcopenshell = _ifc
 
 
-def sub(shape, ty):
-    """Iterate over sub-shapes of a given topology type."""
-    cast = _TOPO_CAST[ty]
-    exp = OCC.Core.TopExp.TopExp_Explorer(shape, ty)
-    while exp.More():
-        yield cast(exp.Current())
-        exp.Next()
+# ---------------------------------------------------------------------------
+# Geometry helpers – convert IfcCurveBoundedPlane to 3D vertices directly,
+# without pythonocc-core / OpenCASCADE.
+# ---------------------------------------------------------------------------
+
+def _normalize(v):
+    length = math.sqrt(sum(c * c for c in v))
+    if length == 0:
+        return v
+    return tuple(c / length for c in v)
 
 
-def ring(wire, face):
-    """Return a list of (x, y, z) tuples for vertices along a wire."""
-    def vertices():
-        exp = OCC.Core.BRepTools.BRepTools_WireExplorer(wire, face)
-        while exp.More():
-            yield exp.CurrentVertex()
-            exp.Next()
-        yield exp.CurrentVertex()
-
-    return [
-        (p.X(), p.Y(), p.Z())
-        for p in map(OCC.Core.BRep.BRep_Tool.Pnt, vertices())
-    ]
+def _cross(a, b):
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
 
 
-def get_vertices(shape):
-    """Extract the first set of face vertices from a shape."""
-    for face in sub(shape, FACE):
-        for idx, wire in enumerate(sub(face, WIRE)):
-            verts = ring(wire, face)
-            if idx > 0:
-                verts.reverse()
-            return verts
+def _transform_2d_to_3d(points_2d, placement):
+    """
+    Transform a list of 2D local (u, v) coordinates into 3D world coordinates
+    using an IfcAxis2Placement3D.
+    """
+    origin = tuple(float(c) for c in placement.Location.Coordinates)
+
+    if placement.Axis:
+        z_axis = _normalize(tuple(float(c) for c in placement.Axis.DirectionRatios))
+    else:
+        z_axis = (0.0, 0.0, 1.0)
+
+    if placement.RefDirection:
+        x_axis = _normalize(tuple(float(c) for c in placement.RefDirection.DirectionRatios))
+    else:
+        x_axis = (1.0, 0.0, 0.0)
+
+    y_axis = _normalize(_cross(z_axis, x_axis))
+
+    vertices = []
+    for coords in points_2d:
+        u = float(coords[0])
+        v = float(coords[1])
+        x3d = origin[0] + u * x_axis[0] + v * y_axis[0]
+        y3d = origin[1] + u * x_axis[1] + v * y_axis[1]
+        z3d = origin[2] + u * x_axis[2] + v * y_axis[2]
+        vertices.append((x3d, y3d, z3d))
+    return vertices
+
+
+def _curve_to_2d_points(curve):
+    """Extract 2D point coordinates from IfcPolyline or IfcCompositeCurve."""
+    if curve.is_a('IfcPolyline'):
+        return [pt.Coordinates for pt in curve.Points]
+    if curve.is_a('IfcCompositeCurve'):
+        pts = []
+        for seg in (curve.Segments or []):
+            parent = seg.ParentCurve
+            if parent.is_a('IfcPolyline'):
+                # Skip last point to avoid duplicating the junction vertex
+                pts.extend(pt.Coordinates for pt in parent.Points[:-1])
+            elif parent.is_a('IfcTrimmedCurve'):
+                # Approximate: just take start/end trim points
+                for trim in list(parent.Trim1 or []) + list(parent.Trim2 or []):
+                    if hasattr(trim, 'Coordinates'):
+                        pts.append(trim.Coordinates)
+        return pts
     return []
+
+
+def get_boundary_vertices(geom):
+    """
+    Return a list of (x, y, z) tuples for the outer boundary of an
+    IfcCurveBoundedPlane, computed via pure Python coordinate transform.
+    Returns [] if the geometry type is unsupported or data is missing.
+    """
+    if geom is None:
+        return []
+    if not geom.is_a('IfcCurveBoundedPlane'):
+        return []
+    basis = geom.BasisSurface
+    if basis is None or not basis.is_a('IfcPlane'):
+        return []
+    placement = basis.Position
+    if placement is None:
+        return []
+    outer = geom.OuterBoundary
+    if outer is None:
+        return []
+
+    points_2d = _curve_to_2d_points(outer)
+    if not points_2d:
+        return []
+
+    return _transform_2d_to_3d(points_2d, placement)
 
 
 # ---------------------------------------------------------------------------
@@ -133,12 +165,8 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
     Returns the resolved output path.
     """
 
-    # Load heavy geometry libraries on first use
+    # Import ifcopenshell (no OCC/pythonocc-core required)
     _init_geometry()
-
-    # IfcOpenShell + OpenCASCADE settings
-    settings = ifcopenshell.geom.settings()
-    settings.set(settings.USE_PYTHON_OPENCASCADE, True)
 
     print(f"[INFO] Opening IFC file: {ifc_path}")
     ifc_file = ifcopenshell.open(str(ifc_path))
@@ -172,31 +200,105 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
         location = root.createElement('Location')
         campus.appendChild(location)
 
+        def _dms_to_decimal(dms_tuple):
+            """Convert IFC DMS tuple (deg, min, sec, microsec) to decimal degrees."""
+            if not dms_tuple or len(dms_tuple) < 1:
+                return 0.0
+            d = float(dms_tuple[0])
+            m = float(dms_tuple[1]) if len(dms_tuple) > 1 else 0.0
+            s = float(dms_tuple[2]) if len(dms_tuple) > 2 else 0.0
+            us = float(dms_tuple[3]) if len(dms_tuple) > 3 else 0.0
+            sign = -1.0 if d < 0 else 1.0
+            return sign * (abs(d) + m / 60.0 + s / 3600.0 + us / 3600000000.0)
+
         if element.RefLongitude:
+            lon_dec = _dms_to_decimal(element.RefLongitude)
             longitude = root.createElement('Longitude')
-            longitude.appendChild(root.createTextNode(str(element.RefLongitude[0])))
+            longitude.appendChild(root.createTextNode(str(round(lon_dec, 8))))
             location.appendChild(longitude)
 
         if element.RefLatitude:
+            lat_dec = _dms_to_decimal(element.RefLatitude)
             latitude = root.createElement('Latitude')
-            latitude.appendChild(root.createTextNode(str(element.RefLatitude[0])))
+            latitude.appendChild(root.createTextNode(str(round(lat_dec, 8))))
             location.appendChild(latitude)
 
         elevation = root.createElement('Elevation')
         elevation.appendChild(root.createTextNode(str(element.RefElevation or 0)))
         location.appendChild(elevation)
 
-    address = ifc_file.by_type('IfcPostalAddress')
+        # Site name → Location/Name
+        site_name = (element.Name or '').strip()
+        if site_name:
+            loc_name = root.createElement('Name')
+            loc_name.appendChild(root.createTextNode(site_name))
+            location.appendChild(loc_name)
+
+        # TrueNorth: angle from geographic North, read from IfcGeometricRepresentationContext
+        # TrueNorth direction vector (2D) → angle in degrees (clockwise from North)
+        try:
+            for ctx in ifc_file.by_type('IfcGeometricRepresentationContext'):
+                tn = getattr(ctx, 'TrueNorth', None)
+                if tn is None:
+                    continue
+                dr = tn.DirectionRatios
+                if len(dr) >= 2:
+                    import math as _math
+                    # atan2(x, y): angle from Y+ (North) clockwise
+                    angle_deg = _math.degrees(_math.atan2(float(dr[0]), float(dr[1])))
+                    true_north_el = root.createElement('CADModelAzimuth')
+                    true_north_el.appendChild(root.createTextNode(str(round(angle_deg, 4))))
+                    location.appendChild(true_north_el)
+                    break
+        except Exception:
+            pass
+
+    # Collect all postal addresses from IfcSite, IfcBuilding, or standalone
+    def _collect_addresses(ifc_f):
+        addrs = []
+        # From IfcSite.SiteAddress
+        for s in ifc_f.by_type('IfcSite'):
+            if getattr(s, 'SiteAddress', None):
+                addrs.append(s.SiteAddress)
+        # From IfcBuilding.BuildingAddress
+        for b in ifc_f.by_type('IfcBuilding'):
+            if getattr(b, 'BuildingAddress', None):
+                addrs.append(b.BuildingAddress)
+        # Standalone IfcPostalAddress
+        addrs.extend(ifc_f.by_type('IfcPostalAddress'))
+        # Deduplicate by id
+        seen = set()
+        result = []
+        for a in addrs:
+            if id(a) not in seen:
+                seen.add(id(a))
+                result.append(a)
+        return result
+
+    address = _collect_addresses(ifc_file)
+
     for element in address:
         if location is not None and element.PostalCode:
             zipcode = root.createElement('ZipcodeOrPostalCode')
             zipcode.appendChild(root.createTextNode(element.PostalCode))
             location.appendChild(zipcode)
 
-        if location is not None and element.Region and element.Country:
-            name = root.createElement('Name')
-            name.appendChild(root.createTextNode(element.Region + ', ' + element.Country))
-            location.appendChild(name)
+        # Build a descriptive name from available address fields
+        addr_parts = []
+        if getattr(element, 'AddressLines', None):
+            addr_parts.extend([ln for ln in element.AddressLines if ln])
+        if getattr(element, 'Town', None):
+            addr_parts.append(element.Town)
+        if getattr(element, 'Region', None):
+            addr_parts.append(element.Region)
+        if getattr(element, 'Country', None):
+            addr_parts.append(element.Country)
+        if location is not None and addr_parts:
+            # Only add Name if not already present from site name
+            if not location.getElementsByTagName('Name'):
+                loc_name = root.createElement('Name')
+                loc_name.appendChild(root.createTextNode(', '.join(addr_parts)))
+                location.appendChild(loc_name)
 
     # -- Building (IfcBuilding) ----------------------------------------------
     building = None
@@ -205,20 +307,37 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
         building = root.createElement('Building')
         building.setAttribute('id', fix_xml_bldng(element.GlobalId))
         building.setAttribute('buildingType', 'Unknown')
+        # Building name
+        bldg_name = (element.Name or '').strip()
+        if bldg_name:
+            building.setAttribute('name', bldg_name)
         if campus is not None:
             campus.appendChild(building)
         dict_id[fix_xml_bldng(element.GlobalId)] = building
 
     if building is not None:
         for element in address:
-            if element.Region and element.Country:
+            # Build full street address string
+            parts = []
+            if getattr(element, 'AddressLines', None):
+                parts.extend([ln for ln in element.AddressLines if ln])
+            if getattr(element, 'Town', None):
+                parts.append(element.Town)
+            if getattr(element, 'PostalCode', None):
+                parts.append(element.PostalCode)
+            if getattr(element, 'Region', None):
+                parts.append(element.Region)
+            if getattr(element, 'Country', None):
+                parts.append(element.Country)
+            if parts:
                 streetAddress = root.createElement('StreetAddress')
-                streetAddress.appendChild(root.createTextNode(element.Region + ', ' + element.Country))
+                streetAddress.appendChild(root.createTextNode(', '.join(parts)))
                 building.appendChild(streetAddress)
+                break  # one address block is enough
 
     # -- BuildingStorey (IfcBuildingStorey) -----------------------------------
     storeys = ifc_file.by_type('IfcBuildingStorey')
-    storey_name = 1
+    storey_idx = 1
     for element in storeys:
         buildingStorey = root.createElement('BuildingStorey')
         buildingStorey.setAttribute('id', fix_xml_stry(element.GlobalId))
@@ -226,45 +345,132 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             building.appendChild(buildingStorey)
         dict_id[fix_xml_stry(element.GlobalId)] = buildingStorey
 
+        # Use the IFC Name (e.g. "Földszint", "Padlás") if available
+        storey_display_name = (element.Name or '').strip() or ('Storey_%d' % storey_idx)
+        storey_idx += 1
         name = root.createElement('Name')
-        name.appendChild(root.createTextNode('Storey_%d' % storey_name))
-        storey_name += 1
+        name.appendChild(root.createTextNode(storey_display_name))
         buildingStorey.appendChild(name)
 
         level = root.createElement('Level')
-        level.appendChild(root.createTextNode(str(element.Elevation)))
+        level.appendChild(root.createTextNode(str(element.Elevation or 0)))
         buildingStorey.appendChild(level)
 
     # -- Space (IfcSpace) ----------------------------------------------------
     spaces = ifc_file.by_type('IfcSpace')
-    space_name = 1
+    space_idx = 1
     for s in spaces:
+        room_number   = (s.Name or '').strip()
+        room_function = (s.LongName or '').strip()
+
         space = root.createElement('Space')
         space.setAttribute('id', fix_xml_spc(s.GlobalId))
+        # 'name' attribute: function name (LongName), fallback to room number
+        space.setAttribute('name', room_function or room_number or ('Space_%d' % space_idx))
         if building is not None:
             building.appendChild(space)
         dict_id[fix_xml_spc(s.GlobalId)] = space
         if s.Decomposes:
             space.setAttribute('buildingStoreyIdRef', fix_xml_stry(s.Decomposes[0].RelatingObject.GlobalId))
 
-        area = root.createElement('Area')
-        volume = root.createElement('Volume')
-
+        # Collect quantities from BaseQuantities (IfcElementQuantity)
+        # and properties from IfcPropertySet
+        bq = {}   # BaseQuantities: name → quantity object
+        pset = {} # property sets: name → value
         for r in s.IsDefinedBy:
-            if r.is_a('IfcRelDefinesByProperties'):
-                if r.RelatingPropertyDefinition.is_a('IfcPropertySet'):
-                    for p in r.RelatingPropertyDefinition.HasProperties:
-                        if p.Name == 'Area':
-                            area.appendChild(root.createTextNode(str(p.NominalValue.wrappedValue)))
-                            space.appendChild(area)
-                        if p.Name == 'Volume':
-                            volume.appendChild(root.createTextNode(str(p.NominalValue.wrappedValue)))
-                            space.appendChild(volume)
+            if not r.is_a('IfcRelDefinesByProperties'):
+                continue
+            pdef = r.RelatingPropertyDefinition
+            if pdef.is_a('IfcElementQuantity') and (pdef.Name or '') in ('BaseQuantities', 'ArchiCADQuantities'):
+                for q in (pdef.Quantities or []):
+                    bq[q.Name] = q
+            elif pdef.is_a('IfcPropertySet'):
+                for p in (pdef.HasProperties or []):
+                    try:
+                        pset[p.Name] = p.NominalValue.wrappedValue
+                    except AttributeError:
+                        pass
 
-        name = root.createElement('Name')
-        name.appendChild(root.createTextNode('Space_%d' % space_name))
-        space_name += 1
-        space.appendChild(name)
+        # Area (GrossFloorArea preferred, fallback to NetFloorArea or pset)
+        area_val = None
+        for key in ('GrossFloorArea', 'NetFloorArea', 'GrossCeilingArea'):
+            if key in bq:
+                try:
+                    area_val = bq[key].AreaValue
+                    break
+                except AttributeError:
+                    pass
+        if area_val is None:
+            area_val = pset.get('Area')
+        if area_val is not None:
+            area_el = root.createElement('Area')
+            area_el.appendChild(root.createTextNode(str(round(float(area_val), 4))))
+            space.appendChild(area_el)
+
+        # Volume (GrossVolume preferred, fallback NetVolume)
+        vol_val = None
+        for key in ('GrossVolume', 'NetVolume'):
+            if key in bq:
+                try:
+                    vol_val = bq[key].VolumeValue
+                    break
+                except AttributeError:
+                    pass
+        if vol_val is None:
+            vol_val = pset.get('Volume')
+        if vol_val is not None:
+            vol_el = root.createElement('Volume')
+            vol_el.appendChild(root.createTextNode(str(round(float(vol_val), 4))))
+            space.appendChild(vol_el)
+
+        # Build display name: room number + function (for <Name> child element)
+        if room_number and room_function:
+            display_name = f'{room_number} {room_function}'
+        elif room_function:
+            display_name = room_function
+        elif room_number:
+            display_name = room_number
+        else:
+            display_name = 'Space_%d' % space_idx
+        space_idx += 1
+
+        name_el = root.createElement('Name')
+        name_el.appendChild(root.createTextNode(display_name))
+        space.appendChild(name_el)
+
+        # Description = function name
+        if room_function:
+            desc = root.createElement('Description')
+            desc.appendChild(root.createTextNode(room_function))
+            space.appendChild(desc)
+
+        # Height fields – tag names matched to Winwatt's expected gbXML import format.
+        # Winwatt uses <Height> for room height and <CeilingHeight> for false ceiling.
+        # When <Height> is present, Winwatt calculates Volume = Area × Height automatically.
+        # IFC BaseQuantities mapping:
+        #   Height              → <Height>         (Belmagasság)
+        #   FinishCeilingHeight → <CeilingHeight>  (Álmennyezetmagasság)
+        #   ClearHeight         → <ClearHeight>    (Szabad belmagasság, extra info)
+        #   FinishFloorHeight   → <FinishFloorHeight> (Padlóburkolat szintje, extra info)
+        height_fields = [
+            ('Height',              'Height',            'Meters'),
+            ('FinishCeilingHeight', 'CeilingHeight',     'Meters'),
+            ('ClearHeight',         'ClearHeight',       'Meters'),
+            ('FinishFloorHeight',   'FinishFloorHeight', 'Meters'),
+        ]
+        for bq_key, xml_tag, unit in height_fields:
+            if bq_key not in bq:
+                continue
+            try:
+                h_val = bq[bq_key].LengthValue
+            except AttributeError:
+                continue
+            if h_val is None:
+                continue
+            h_el = root.createElement(xml_tag)
+            h_el.setAttribute('unit', unit)
+            h_el.appendChild(root.createTextNode(str(round(float(h_val), 4))))
+            space.appendChild(h_el)
 
         # -- SpaceBoundary ---------------------------------------------------
         for element in s.BoundedBy:
@@ -277,19 +483,16 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             boundaryGeom = element.ConnectionGeometry.SurfaceOnRelatingElement
             if boundaryGeom is None:
                 continue
-            if boundaryGeom.is_a('IfcCurveBoundedPlane') and boundaryGeom.InnerBoundaries is None:
-                boundaryGeom.InnerBoundaries = ()
-
-            try:
-                space_boundary_shape = ifcopenshell.geom.create_shape(settings, boundaryGeom)
-            except Exception as e:
-                print(f"[WARN] Skipping SpaceBoundary {element.GlobalId}: geometry error – {e}")
-                continue
 
             if (element.RelatedBuildingElement.is_a('IfcCovering')
                     or element.RelatedBuildingElement.is_a('IfcSlab')
                     or element.RelatedBuildingElement.is_a('IfcWall')
                     or element.RelatedBuildingElement.is_a('IfcRoof')):
+
+                vertices = get_boundary_vertices(boundaryGeom)
+                if not vertices:
+                    print(f"[WARN] Skipping SpaceBoundary {element.GlobalId}: no vertices extracted")
+                    continue
 
                 spaceBoundary = root.createElement('SpaceBoundary')
                 spaceBoundary.setAttribute('isSecondLevelBoundary', 'true')
@@ -299,16 +502,10 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
                 planarGeometry = root.createElement('PlanarGeometry')
                 spaceBoundary.appendChild(planarGeometry)
 
-                try:
-                    placement = element.RelatingSpace.ObjectPlacement.PlacementRelTo
-                    new_z = placement.RelativePlacement.Location.Coordinates[2] if placement else 0.0
-                except (AttributeError, TypeError, IndexError):
-                    new_z = 0.0
                 polyLoop = root.createElement('PolyLoop')
 
-                for v in get_vertices(space_boundary_shape):
+                for v in vertices:
                     x, y, z = v
-                    z += new_z
                     point = root.createElement('CartesianPoint')
                     for c in (x, y, z):
                         coord = root.createElement('Coordinate')
@@ -334,28 +531,24 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             continue
 
         surfaceGeom = element.ConnectionGeometry.SurfaceOnRelatingElement
-        if surfaceGeom.is_a('IfcCurveBoundedPlane') and surfaceGeom.InnerBoundaries is None:
-            surfaceGeom.InnerBoundaries = ()
 
-        try:
-            space_boundary_shape = ifcopenshell.geom.create_shape(settings, surfaceGeom)
-        except Exception as e:
-            print(f"[WARN] Skipping Surface {element.GlobalId}: geometry error – {e}")
+        is_wall_or_slab = (
+            element.RelatedBuildingElement.is_a('IfcCovering')
+            or element.RelatedBuildingElement.is_a('IfcSlab')
+            or element.RelatedBuildingElement.is_a('IfcWall')
+            or element.RelatedBuildingElement.is_a('IfcRoof')
+        )
+        is_window = element.RelatedBuildingElement.is_a('IfcWindow')
+
+        if not (is_wall_or_slab or is_window):
             continue
 
-        def _get_z(elem):
-            """Safely extract storey elevation offset."""
-            try:
-                placement = elem.RelatingSpace.ObjectPlacement.PlacementRelTo
-                return placement.RelativePlacement.Location.Coordinates[2] if placement else 0.0
-            except (AttributeError, TypeError, IndexError):
-                return 0.0
+        vertices = get_boundary_vertices(surfaceGeom)
+        if not vertices:
+            print(f"[WARN] Skipping boundary {element.GlobalId}: no vertices extracted")
+            continue
 
-        if (element.RelatedBuildingElement.is_a('IfcCovering')
-                or element.RelatedBuildingElement.is_a('IfcSlab')
-                or element.RelatedBuildingElement.is_a('IfcWall')
-                or element.RelatedBuildingElement.is_a('IfcRoof')):
-
+        if is_wall_or_slab:
             surface = root.createElement('Surface')
             surface.setAttribute('id', fix_xml_id(element.GlobalId))
             dict_id[fix_xml_id(element.GlobalId)] = surface
@@ -386,19 +579,15 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             planarGeometry = root.createElement('PlanarGeometry')
             surface.appendChild(planarGeometry)
 
-            new_z = _get_z(element)
             polyLoop = root.createElement('PolyLoop')
-
-            for v in get_vertices(space_boundary_shape):
+            for v in vertices:
                 x, y, z = v
-                z += new_z
                 point = root.createElement('CartesianPoint')
                 for c in (x, y, z):
                     coord = root.createElement('Coordinate')
                     coord.appendChild(root.createTextNode(str(c)))
                     point.appendChild(coord)
                 polyLoop.appendChild(point)
-
             planarGeometry.appendChild(polyLoop)
 
             objectId = root.createElement('CADObjectId')
@@ -407,7 +596,7 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
 
             campus.appendChild(surface)
 
-        if element.RelatedBuildingElement.is_a('IfcWindow') and surface is not None:
+        if is_window and surface is not None:
             opening = root.createElement('Opening')
             opening.setAttribute('windowTypeIdRef', fix_xml_id(element.RelatedBuildingElement.GlobalId))
             opening.setAttribute('openingType', 'OperableWindow')
@@ -417,19 +606,15 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             planarGeometry = root.createElement('PlanarGeometry')
             opening.appendChild(planarGeometry)
 
-            new_z = _get_z(element)
             polyLoop = root.createElement('PolyLoop')
-
-            for v in get_vertices(space_boundary_shape):
+            for v in vertices:
                 x, y, z = v
-                z += new_z
                 point = root.createElement('CartesianPoint')
                 for c in (x, y, z):
                     coord = root.createElement('Coordinate')
                     coord.appendChild(root.createTextNode(str(c)))
                     point.appendChild(coord)
                 polyLoop.appendChild(point)
-
             planarGeometry.appendChild(polyLoop)
 
             name = root.createElement('Name')
