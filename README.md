@@ -15,13 +15,15 @@ This project originated as the graduation research of M.G. (Maarten) Visschers a
 
 ### 1. Install dependencies
 
-The converter requires **IfcOpenShell** (for reading IFC files) and **PythonOCC / OpenCASCADE** (for converting implicit geometry to explicit coordinates). The recommended installation method is conda:
+The converter only requires **IfcOpenShell** for reading IFC files. Explicit geometry (the `IfcCurveBoundedPlane` attached to each space boundary) is transformed to 3D coordinates in pure Python, so PythonOCC / OpenCASCADE is no longer needed.
 
 ```bash
-conda install -c conda-forge ifcopenshell pythonocc-core
+conda install -c conda-forge ifcopenshell
+# or, if you already have a Python with ifcopenshell wheels available:
+pip install ifcopenshell
 ```
 
-Standard-library modules used: `argparse`, `datetime`, `xml.dom.minidom`, `pathlib`.
+Standard-library modules used: `argparse`, `datetime`, `logging`, `math`, `re`, `sys`, `time`, `pathlib`, `xml.dom.minidom`.
 
 ### 2. Run the converter
 
@@ -39,7 +41,7 @@ output:  output/MyBuilding_gbXML.xml
 ### 3. CLI options
 
 ```
-usage: IFC_gbXML_Convert.py [-h] [-o OUTPUT_DIR] ifc_file
+usage: IFC_gbXML_Convert.py [-h] [-o OUTPUT_DIR] [-v] [-q] ifc_file
 
 positional arguments:
   ifc_file                    Path to the input .ifc file
@@ -47,6 +49,8 @@ positional arguments:
 options:
   -h, --help                  Show this help message and exit
   -o, --output-dir OUTPUT_DIR Directory for output (default: ./output)
+  -v, --verbose               Enable DEBUG-level logging
+  -q, --quiet                 Suppress INFO logging (warnings/errors only)
 ```
 
 ### Examples
@@ -73,9 +77,9 @@ The converter relies on **2nd level space boundaries** (`IfcRelSpaceBoundary`) t
 3. Make sure **Export base quantities** is checked.
 4. Under **Space boundaries**, select **2nd level** (this is critical).
 5. Ensure rooms/spaces are properly defined and bounded in the Revit model.
-„
+
 ## IFC-to-gbXML entity mapping
-„
+
 The table below shows which IFC entities are read and what gbXML elements they produce.
 
 | IFC entity | gbXML element | Notes |
@@ -97,12 +101,12 @@ The table below shows which IFC entities are read and what gbXML elements they p
 
 ## Geometry conversion
 
-IFC typically stores geometry in an **implicit** representation (extrusions, swept solids, CSG), whereas gbXML requires **explicit** planar geometry (`PolyLoop` with `CartesianPoint` coordinates). The converter handles this translation using OpenCASCADE (via PythonOCC):
+IFC stores space-boundary geometry as an `IfcCurveBoundedPlane` — a 2D outer boundary (IfcPolyline or IfcCompositeCurve) defined on a plane, plus a placement in 3D. gbXML requires **explicit** planar geometry (`PolyLoop` with `CartesianPoint` coordinates). The converter performs this translation in pure Python (no OpenCASCADE / PythonOCC needed):
 
-1. The `IfcCurveBoundedPlane` attached to each `IfcRelSpaceBoundary` is passed to `ifcopenshell.geom.create_shape()`.
-2. OpenCASCADE tessellates the resulting shape into faces, wires, edges and vertices.
-3. The vertex coordinates are extracted and written as gbXML `CartesianPoint` elements.
-4. A Z-offset is applied to account for storey-level placement by reading the `IfcCartesianPoint` of the related `IfcBuildingStorey`.
+1. For each `IfcRelSpaceBoundary`, the outer 2D polyline points are extracted from the `IfcCurveBoundedPlane` (`_curve_to_2d_points`).
+2. The 2D points are lifted into 3D world coordinates using the plane's `IfcAxis2Placement3D` (origin + Z-axis + X-axis) via `_transform_2d_to_3d`.
+3. All coordinates are scaled to metres using the IFC project's length unit (detected from `IfcUnitAssignment`).
+4. The resulting vertices are written as gbXML `CartesianPoint` elements under `PolyLoop`.
 
 ## Test cases
 

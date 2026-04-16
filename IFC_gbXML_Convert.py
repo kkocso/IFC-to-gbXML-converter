@@ -22,23 +22,44 @@ Author: Maarten Visschers (original), refactored for CLI usage.
 
 import argparse
 import datetime
+import logging
 import math
-import os
+import re
 import sys
 import time
 from pathlib import Path
 from xml.dom import minidom
 
 
-# Module-level reference (populated by _init_geometry)
-ifcopenshell = None
+logger = logging.getLogger("ifc2gbxml")
 
 
-def _init_geometry():
-    """Import ifcopenshell (no OCC required)."""
-    global ifcopenshell
-    import ifcopenshell as _ifc
-    ifcopenshell = _ifc
+def _load_ifcopenshell():
+    """
+    Import ifcopenshell on demand.
+
+    Keeping this out of module import lets `--help` work without the dependency
+    installed, and lets us raise a friendlier error than ModuleNotFoundError.
+    """
+    try:
+        import ifcopenshell  # noqa: PLC0415  (intentional lazy import)
+    except ImportError as exc:
+        raise RuntimeError(
+            "ifcopenshell is required but not installed. "
+            "Install with: conda install -c conda-forge ifcopenshell"
+        ) from exc
+    return ifcopenshell
+
+
+# SI unit prefix → metric scale factor.  Used once per convert() call to
+# normalise IFC length units to metres.
+_PREFIX_SCALES = {
+    'EXA': 1e18, 'PETA': 1e15, 'TERA': 1e12, 'GIGA': 1e9, 'MEGA': 1e6,
+    'KILO': 1e3, 'HECTO': 1e2, 'DECA': 1e1,
+    None: 1.0,
+    'DECI': 1e-1, 'CENTI': 1e-2, 'MILLI': 1e-3, 'MICRO': 1e-6,
+    'NANO': 1e-9, 'PICO': 1e-12, 'FEMTO': 1e-15, 'ATTO': 1e-18,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -198,9 +219,19 @@ def _compute_surface_width(vertices, normal):
 # ---------------------------------------------------------------------------
 # XML ID sanitisation helpers
 # ---------------------------------------------------------------------------
+_ID_INVALID = re.compile(r'[^A-Za-z0-9_-]')
+
+
 def _sanitise(prefix, raw):
-    """Strip characters that are illegal in XML IDs."""
-    return prefix + raw.replace('$', '').replace(':', '').replace(' ', '').replace('(', '').replace(')', '')
+    """
+    Return a valid XML ID built from *prefix* + *raw*.
+
+    Any character not in [A-Za-z0-9_-] is stripped.  The *prefix* guarantees
+    that the resulting ID never starts with a digit, which XML NCName forbids.
+    """
+    if raw is None:
+        return prefix
+    return prefix + _ID_INVALID.sub('', str(raw))
 
 
 def fix_xml_cmps(a):   return _sanitise('campus', a)
@@ -222,33 +253,28 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
     Returns the resolved output path.
     """
 
-    # Import ifcopenshell (no OCC/pythonocc-core required)
-    _init_geometry()
+    ifcopenshell = _load_ifcopenshell()
 
-    print(f"[INFO] Opening IFC file: {ifc_path}")
-    ifc_file = ifcopenshell.open(str(ifc_path))
+    logger.info("Opening IFC file: %s", ifc_path)
+    try:
+        ifc_file = ifcopenshell.open(str(ifc_path))
+    except Exception as exc:  # ifcopenshell raises RuntimeError/OSError for bad files
+        raise RuntimeError(f"Failed to open IFC file {ifc_path}: {exc}") from exc
 
     # Detect IFC project length unit and compute scale factor to convert to metres.
     # ArchiCAD typically exports in MILLIMETRE → scale = 0.001.
     # If the project uses METRE → scale = 1.0.
-    _prefix_scales = {
-        'EXA': 1e18, 'PETA': 1e15, 'TERA': 1e12, 'GIGA': 1e9, 'MEGA': 1e6,
-        'KILO': 1e3, 'HECTO': 1e2, 'DECA': 1e1,
-        None: 1.0,
-        'DECI': 1e-1, 'CENTI': 1e-2, 'MILLI': 1e-3, 'MICRO': 1e-6,
-        'NANO': 1e-9, 'PICO': 1e-12, 'FEMTO': 1e-15, 'ATTO': 1e-18,
-    }
     length_scale = 1.0  # default: already in metres
     try:
         for unit_assign in ifc_file.by_type('IfcUnitAssignment'):
             for u in unit_assign.Units:
                 if u.is_a('IfcSIUnit') and u.UnitType == 'LENGTHUNIT':
                     prefix = getattr(u, 'Prefix', None)
-                    length_scale = _prefix_scales.get(prefix, 1.0)
+                    length_scale = _PREFIX_SCALES.get(prefix, 1.0)
                     break
-    except Exception:
-        pass
-    print(f"[INFO] IFC length unit scale factor: {length_scale} (1.0 = metres, 0.001 = millimetres)")
+    except (AttributeError, TypeError) as exc:
+        logger.warning("Could not determine IFC length unit, defaulting to metres: %s", exc)
+    logger.info("IFC length unit scale factor: %s (1.0 = metres, 0.001 = millimetres)", length_scale)
 
     # Create the XML root
     root = minidom.Document()
@@ -268,6 +294,10 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
 
     # -- Campus (IfcSite) ----------------------------------------------------
     site = ifc_file.by_type('IfcSite')
+    if len(site) > 1:
+        logger.warning(
+            "IFC file contains %d IfcSite entities; only the last one will be "
+            "emitted as <Campus> (see README 'Known limitations').", len(site))
     campus = None
     location = None
     for element in site:
@@ -322,15 +352,14 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
                     continue
                 dr = tn.DirectionRatios
                 if len(dr) >= 2:
-                    import math as _math
                     # atan2(x, y): angle from Y+ (North) clockwise
-                    angle_deg = _math.degrees(_math.atan2(float(dr[0]), float(dr[1])))
+                    angle_deg = math.degrees(math.atan2(float(dr[0]), float(dr[1])))
                     true_north_el = root.createElement('CADModelAzimuth')
                     true_north_el.appendChild(root.createTextNode(str(round(angle_deg, 4))))
                     location.appendChild(true_north_el)
                     break
-        except Exception:
-            pass
+        except (AttributeError, TypeError, ValueError) as exc:
+            logger.warning("Could not read TrueNorth from representation context: %s", exc)
 
     # Collect all postal addresses from IfcSite, IfcBuilding, or standalone
     def _collect_addresses(ifc_f):
@@ -354,6 +383,22 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
                 result.append(a)
         return result
 
+    def _address_parts(postal_addr, include_postal_code):
+        """Return the list of non-empty address fields in street → country order."""
+        parts = []
+        lines = getattr(postal_addr, 'AddressLines', None)
+        if lines:
+            parts.extend([ln for ln in lines if ln])
+        if getattr(postal_addr, 'Town', None):
+            parts.append(postal_addr.Town)
+        if include_postal_code and getattr(postal_addr, 'PostalCode', None):
+            parts.append(postal_addr.PostalCode)
+        if getattr(postal_addr, 'Region', None):
+            parts.append(postal_addr.Region)
+        if getattr(postal_addr, 'Country', None):
+            parts.append(postal_addr.Country)
+        return parts
+
     address = _collect_addresses(ifc_file)
 
     for element in address:
@@ -362,16 +407,9 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             zipcode.appendChild(root.createTextNode(element.PostalCode))
             location.appendChild(zipcode)
 
-        # Build a descriptive name from available address fields
-        addr_parts = []
-        if getattr(element, 'AddressLines', None):
-            addr_parts.extend([ln for ln in element.AddressLines if ln])
-        if getattr(element, 'Town', None):
-            addr_parts.append(element.Town)
-        if getattr(element, 'Region', None):
-            addr_parts.append(element.Region)
-        if getattr(element, 'Country', None):
-            addr_parts.append(element.Country)
+        # Build a descriptive name from available address fields (no postal code –
+        # that already lives in its own element).
+        addr_parts = _address_parts(element, include_postal_code=False)
         if location is not None and addr_parts:
             # Only add Name if not already present from site name
             if not location.getElementsByTagName('Name'):
@@ -382,6 +420,11 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
     # -- Building (IfcBuilding) ----------------------------------------------
     building = None
     buildings = ifc_file.by_type('IfcBuilding')
+    if len(buildings) > 1:
+        logger.warning(
+            "IFC file contains %d IfcBuilding entities; only the last one will "
+            "host storeys, spaces and surfaces (see README 'Known limitations').",
+            len(buildings))
     for element in buildings:
         building = root.createElement('Building')
         building.setAttribute('id', fix_xml_bldng(element.GlobalId))
@@ -396,18 +439,8 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
 
     if building is not None:
         for element in address:
-            # Build full street address string
-            parts = []
-            if getattr(element, 'AddressLines', None):
-                parts.extend([ln for ln in element.AddressLines if ln])
-            if getattr(element, 'Town', None):
-                parts.append(element.Town)
-            if getattr(element, 'PostalCode', None):
-                parts.append(element.PostalCode)
-            if getattr(element, 'Region', None):
-                parts.append(element.Region)
-            if getattr(element, 'Country', None):
-                parts.append(element.Country)
+            # Build full street address string (street through country, plus zip)
+            parts = _address_parts(element, include_postal_code=True)
             if parts:
                 streetAddress = root.createElement('StreetAddress')
                 streetAddress.appendChild(root.createTextNode(', '.join(parts)))
@@ -573,7 +606,7 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
 
                 vertices = get_boundary_vertices(boundaryGeom)
                 if not vertices:
-                    print(f"[WARN] Skipping SpaceBoundary {element.GlobalId}: no vertices extracted")
+                    logger.warning("Skipping SpaceBoundary %s: no vertices extracted", element.GlobalId)
                     continue
 
                 spaceBoundary = root.createElement('SpaceBoundary')
@@ -607,9 +640,25 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
     element_to_surface = {}   # element GlobalId → Surface XML node
     window_to_opening  = {}   # window GlobalId → Opening XML node (dedup)
 
+    def _host_wall_gid(window_el):
+        """
+        Return the GlobalId of the wall that hosts the given IfcWindow, following
+        IFC's VoidsElements/FillsVoids relation chain, or None if not resolvable.
+        """
+        try:
+            for fills in (window_el.FillsVoids or []):
+                opening_el = fills.RelatingOpeningElement
+                for voids in (opening_el.VoidsElements or []):
+                    host = voids.RelatingBuildingElement
+                    if host is not None and hasattr(host, 'GlobalId'):
+                        return host.GlobalId
+        except AttributeError:
+            pass
+        return None
+
     boundaries = ifc_file.by_type('IfcRelSpaceBoundary')
     opening_id = 1
-    surface = None  # keep reference for Window openings appended below
+    surface = None  # fallback reference for Window openings when host lookup fails
     for element in boundaries:
         if element.RelatedBuildingElement is None:
             continue
@@ -660,7 +709,7 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
 
         vertices = get_boundary_vertices(surfaceGeom)
         if not vertices:
-            print(f"[WARN] Skipping boundary {element.GlobalId}: no vertices extracted")
+            logger.warning("Skipping boundary %s: no vertices extracted", element.GlobalId)
             continue
 
         # Scale vertices to metres
@@ -755,10 +804,23 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             # Register so duplicate boundaries don't create extra surfaces
             element_to_surface[element.RelatedBuildingElement.GlobalId] = surface
 
-        if is_window and surface is not None:
-            win_gid = element.RelatedBuildingElement.GlobalId
+        if is_window:
+            win_el = element.RelatedBuildingElement
+            win_gid = win_el.GlobalId
             # Fix 3: deduplicate windows – one Opening per IfcWindow element
             if win_gid in window_to_opening:
+                continue
+
+            # Resolve the host wall surface via IFC FillsVoids → VoidsElements.
+            # Only if we have a corresponding <Surface> do we emit the Opening –
+            # otherwise the opening would be attached to an unrelated wall.
+            host_gid = _host_wall_gid(win_el)
+            host_surface = element_to_surface.get(host_gid) if host_gid else None
+            if host_surface is None:
+                # Fallback: most recently created wall surface (legacy behaviour)
+                host_surface = surface
+            if host_surface is None:
+                logger.warning("Window %s: host wall surface not found – skipping opening", win_gid)
                 continue
 
             opening = root.createElement('Opening')
@@ -769,7 +831,6 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             window_to_opening[win_gid] = opening
 
             # Fix 5: window dimensions from IFC OverallWidth / OverallHeight
-            win_el = element.RelatedBuildingElement
             try:
                 win_h = getattr(win_el, 'OverallHeight', None)
                 win_w = getattr(win_el, 'OverallWidth', None)
@@ -784,8 +845,8 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
                     ww.appendChild(root.createTextNode(str(win_w_m)))
                     winRectGeom.appendChild(ww)
                     opening.appendChild(winRectGeom)
-            except Exception:
-                pass
+            except (AttributeError, TypeError, ValueError) as exc:
+                logger.warning("Window %s: could not extract OverallWidth/Height: %s", win_gid, exc)
 
             planarGeometry = root.createElement('PlanarGeometry')
             opening.appendChild(planarGeometry)
@@ -808,7 +869,7 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
             objectId.appendChild(root.createTextNode(fix_xml_name(win_el.Name or win_gid)))
             opening.appendChild(objectId)
 
-            surface.appendChild(opening)
+            host_surface.appendChild(opening)
 
     # -- WindowType (IfcWindow) ----------------------------------------------
     windows = ifc_file.by_type('IfcWindow')
@@ -1047,10 +1108,12 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
 
     # -- DocumentHistory -----------------------------------------------------
     programInfo = ifc_file.by_type('IfcApplication')
+    personInfo = ifc_file.by_type('IfcPerson')
     docHistory = root.createElement('DocumentHistory')
+
     for element in programInfo:
         program = root.createElement('ProgramInfo')
-        program.setAttribute('id', element.ApplicationIdentifier)
+        program.setAttribute('id', fix_xml_id(element.ApplicationIdentifier or ''))
         docHistory.appendChild(program)
 
         company = root.createElement('CompanyName')
@@ -1065,20 +1128,21 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
         version.appendChild(root.createTextNode(element.Version))
         program.appendChild(version)
 
-    personInfo = ifc_file.by_type('IfcPerson')
-    for element in personInfo:
+    # CreatedBy requires both a person and a program – only emit when we have both,
+    # otherwise we'd either hit a NameError or produce a half-populated element.
+    if personInfo and programInfo:
+        person_elem = personInfo[0]
+        program_elem = programInfo[0]
         created = root.createElement('CreatedBy')
-        created.setAttribute('personId', element.GivenName)
-
-    for element in programInfo:
-        created.setAttribute('programId', element.ApplicationIdentifier)
+        created.setAttribute('personId', person_elem.GivenName or '')
+        created.setAttribute('programId', fix_xml_id(program_elem.ApplicationIdentifier or ''))
         today = datetime.date.today()
         created.setAttribute('date', today.strftime('%Y-%m-%dT') + time.strftime('%H:%M:%S'))
         docHistory.appendChild(created)
 
     for element in personInfo:
         person = root.createElement('PersonInfo')
-        person.setAttribute('id', element.GivenName)
+        person.setAttribute('id', element.GivenName or '')
         docHistory.appendChild(person)
 
     gbxml.appendChild(docHistory)
@@ -1088,7 +1152,7 @@ def convert(ifc_path: Path, output_path: Path) -> Path:
     with open(output_path, 'w', encoding='utf-8') as f:
         root.writexml(f, indent="  ", addindent="  ", newl='\n')
 
-    print(f"[OK] gbXML written to: {output_path}")
+    logger.info("gbXML written to: %s", output_path)
     return output_path
 
 
@@ -1111,28 +1175,49 @@ def main():
         default="output",
         help="Directory for the output gbXML file (default: ./output)",
     )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable DEBUG-level logging",
+    )
+    parser.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        help="Suppress INFO-level logging (warnings/errors only)",
+    )
     args = parser.parse_args()
+
+    level = logging.INFO
+    if args.verbose:
+        level = logging.DEBUG
+    elif args.quiet:
+        level = logging.WARNING
+    logging.basicConfig(level=level, format="[%(levelname)s] %(message)s")
 
     ifc_path = Path(args.ifc_file).resolve()
     if not ifc_path.exists():
-        print(f"[ERROR] IFC file not found: {ifc_path}", file=sys.stderr)
+        logger.error("IFC file not found: %s", ifc_path)
         sys.exit(1)
-    if not ifc_path.suffix.lower() == '.ifc':
-        print(f"[WARNING] File does not have .ifc extension: {ifc_path}", file=sys.stderr)
+    if ifc_path.suffix.lower() != '.ifc':
+        logger.warning("File does not have .ifc extension: %s", ifc_path)
 
     # Output: output/<input_stem>_gbXML.xml
     output_dir = Path(args.output_dir).resolve()
     output_filename = f"{ifc_path.stem}_gbXML.xml"
     output_path = output_dir / output_filename
 
-    print(f"{'=' * 60}")
-    print(f"  IFC to gbXML Converter")
-    print(f"{'=' * 60}")
-    print(f"  Input:  {ifc_path}")
-    print(f"  Output: {output_path}")
-    print(f"{'=' * 60}")
+    logger.info("=" * 60)
+    logger.info("  IFC to gbXML Converter")
+    logger.info("=" * 60)
+    logger.info("  Input:  %s", ifc_path)
+    logger.info("  Output: %s", output_path)
+    logger.info("=" * 60)
 
-    convert(ifc_path, output_path)
+    try:
+        convert(ifc_path, output_path)
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        sys.exit(2)
 
 
 if __name__ == "__main__":
